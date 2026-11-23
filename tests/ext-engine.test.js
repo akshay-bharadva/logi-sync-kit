@@ -207,7 +207,6 @@ async function test(name, fn) {
     const e = startEngine([rx]);
     e.storage["logi-sync:lastComputer2"] = JSON.stringify(HOSTS[2]);   // even a stale "iPad" memory
     await wait(1500);
-    assert.deepStrictEqual(kb.cookies, [0x4c, 0x4c, 0], "desktop should mark its own channel");
     rx.link(2, false);
     await wait(1300);
     assert.strictEqual(kb.switchedTo, 1, e.log());
@@ -217,6 +216,48 @@ async function test(name, fn) {
   await test("REGRESSION: keyboard leads with laptop+desktop marked: mouse never goes to iPad", async () => {
     const kb = new FakeDev("Signature Slim K950", 1, HOSTS), ms = new FakeDev("Signature Plus M750 L", 1, HOSTS);
     kb.cookies = [0x4c, 0x4c, 0]; ms.cookies = [0x4c, 0x4c, 0];
+    const rx = new FakeHid(0xc548, "USB Receiver", 0xff00, new Map([[1, kb], [2, ms]]));
+    const e = startEngine([rx]);
+    e.storage["logi-sync:lastComputer2"] = JSON.stringify(HOSTS[2]);
+    await wait(1500);
+    rx.link(1, false);
+    await wait(1300);
+    assert.strictEqual(ms.switchedTo, 1, e.log());
+  });
+
+  await test("marking: a device that stays 5+ s gets this channel marked", async () => {
+    const kb = new FakeDev("Signature Slim K950", 1, HOSTS);
+    const rx = new FakeHid(0xc548, "USB Receiver", 0xff00, new Map([[1, kb]]));
+    const e = startEngine([rx]);
+    await wait(11500);
+    assert.deepStrictEqual(kb.cookies, [0, 0x4c, 0], e.log());
+  });
+
+  await test("REGRESSION: device passing through (already reports next channel) is NOT marked", async () => {
+    const ms = new FakeDev("Signature Plus M750 L", 1, HOSTS);
+    const rx = new FakeHid(0xc548, "USB Receiver", 0xff00, new Map([[2, ms]]));
+    const e = startEngine([rx]);
+    await wait(1500);
+    ms.host = 2;                                             // user pressed the button again: now on iPad internally
+    await wait(10000);
+    assert.deepStrictEqual(ms.cookies, [0, 0, 0], e.log());
+  });
+
+  await test("REGRESSION: stray iPad mark on the mouse only -> keyboard still goes to laptop", async () => {
+    const kb = new FakeDev("Signature Slim K950", 1, HOSTS), ms = new FakeDev("Signature Plus M750 L", 1, HOSTS);
+    kb.cookies = [0x4c, 0x4c, 0]; ms.cookies = [0x4c, 0x4c, 0x4c];
+    const rx = new FakeHid(0xc548, "USB Receiver", 0xff00, new Map([[1, kb], [2, ms]]));
+    const e = startEngine([rx]);
+    e.storage["logi-sync:lastComputer2"] = JSON.stringify(HOSTS[2]);
+    await wait(1500);
+    rx.link(2, false);                                       // mouse leaves desktop
+    await wait(1300);
+    assert.strictEqual(kb.switchedTo, 1, e.log());
+  });
+
+  await test("REGRESSION: keyboard leaves, mouse has stray iPad mark + learned iPad -> mouse to laptop", async () => {
+    const kb = new FakeDev("Signature Slim K950", 1, HOSTS), ms = new FakeDev("Signature Plus M750 L", 1, HOSTS);
+    kb.cookies = [0x4c, 0x4c, 0]; ms.cookies = [0x4c, 0x4c, 0x4c];
     const rx = new FakeHid(0xc548, "USB Receiver", 0xff00, new Map([[1, kb], [2, ms]]));
     const e = startEngine([rx]);
     e.storage["logi-sync:lastComputer2"] = JSON.stringify(HOSTS[2]);

@@ -192,6 +192,11 @@ namespace LogiSync
         public string Name = "";
         public int HostCount, CurrentHost = -1;   // 0-based
         public volatile bool Alive = true;
+        public readonly DateTime ConnectedAt = DateTime.UtcNow;
+        public bool Marked;
+        static int swSeq;
+        /// Software ids 2..9 (Logitech's own software uses others, e.g. 0xC).
+        static byte NextSwId() { return (byte)(2 + (Interlocked.Increment(ref swSeq) & 0x7)); }
         public event Action<HidppDevice> Lost;
 
         readonly FileStream fs;
@@ -241,7 +246,9 @@ namespace LogiSync
         {
             var frame = new byte[20];
             frame[0] = LongReport; frame[1] = DevIndex; frame[2] = featureIndex;
-            frame[3] = (byte)((function << 4) | SwId);
+            // A different software id per request: a late reply to an earlier (timed-out)
+            // request then can't be mistaken for this one's.
+            frame[3] = (byte)((function << 4) | NextSwId());
             if (args != null) Array.Copy(args, 0, frame, 4, Math.Min(args.Length, 16));
             lock (replyGate)
             {
@@ -311,21 +318,35 @@ namespace LogiSync
             }
             if (HostNames.Length == 0) HostNames = NameCache.Load(Pid, HostCount);
             else NameCache.Save(Pid, HostNames);
-            try { MarkThisHost(); } catch (HidppException) { }
+            try { ReadMarks(); } catch (HidppException) { }
         }
 
         /// CHANGE_HOST fn2 getCookies -> one byte per channel; fn3 setCookie(host, value).
-        /// We mark this channel so every logi-sync can tell which channels run it.
-        void MarkThisHost()
+        void ReadMarks()
         {
             var c = Request(changeHostIndex, 2, null, 1500);
-            if (CurrentHost >= 0 && CurrentHost < 16 && c[CurrentHost] != Marker)
-            {
-                Request(changeHostIndex, 3, new byte[] { (byte)CurrentHost, Marker }, 1500);
-                c[CurrentHost] = Marker;
-            }
             Participants = new bool[HostCount];
             for (int i = 0; i < HostCount && i < 16; i++) Participants[i] = c[i] == Marker;
+            Marked = CurrentHost >= 0 && CurrentHost < Participants.Length && Participants[CurrentHost];
+        }
+
+        /// Mark this channel as running logi-sync, but only once the device has
+        /// stayed connected for `stable` and still reports the same channel.
+        /// (While you cycle the mouse button through channels it touches each
+        /// computer briefly and may already report the NEXT channel: marking then
+        /// put a mark on the iPad's channel.)
+        /// Returns true if it wrote the mark.
+        public bool TryMarkIfStable(TimeSpan stable)
+        {
+            if (Marked || !Alive || DateTime.UtcNow - ConnectedAt < stable) return false;
+            int before = CurrentHost;
+            RefreshHost();
+            if (CurrentHost != before) { Marked = true; return false; }   // it's leaving; never mark
+            var c = Request(changeHostIndex, 2, null, 1500);
+            if (c[CurrentHost] != Marker) Request(changeHostIndex, 3, new byte[] { (byte)CurrentHost, Marker }, 1500);
+            ReadMarks();
+            Marked = true;
+            return true;
         }
 
         /// HOSTS_INFO (0x1815): fn1 getHostInfo(host) -> [host, status, bus, pages, nameLen, nameMax];
@@ -483,6 +504,8 @@ namespace LogiSync
                     if (marksKnown && !Flag(goneParts, gc)) continue;
                     int sc = toStay(gc);
                     if (sc < 0) break;
+                    // Both devices must agree the channel runs logi-sync.
+                    if (marksKnown && Count(stayParts, stayCurrent) > 0 && !Flag(stayParts, sc)) continue;
                     certain = true; dest = At(stayNames, sc);
                     why = step == 1 ? "mouse moved to the next channel: " + Label(stayNames, sc)
                                     : "mouse button passes " + (step - 1) + " channel(s) not running logi-sync; next one running it: " + Label(stayNames, sc);
@@ -493,13 +516,27 @@ namespace LogiSync
             // 2. Candidates: channels running logi-sync if any are known; otherwise
             //    other paired computers (both devices know them if names allow).
             var cands = new List<int>();
-            string basis;
+            string basis = "";
+            // The gone device's mark for the same computer (matched by name when possible).
+            Func<int, bool> goneMarked = sc =>
+            {
+                if (namesBoth)
+                {
+                    int gi = Array.FindIndex(goneNames, n => Same(n, At(stayNames, sc)));
+                    return gi >= 0 && Flag(goneParts, gi);
+                }
+                return Flag(goneParts, sc);
+            };
+            bool goneMarksKnown = Count(goneParts, goneCurrent) > 0;
             if (Count(stayParts, stayCurrent) > 0)
             {
-                for (int i = 0; i < stayParts.Length; i++) if (i != stayCurrent && stayParts[i]) cands.Add(i);
+                // Both devices must carry the mark: one stray mark (written while a
+                // device was passing through) can't make a tablet a target.
+                for (int i = 0; i < stayParts.Length; i++)
+                    if (i != stayCurrent && stayParts[i] && (!goneMarksKnown || goneMarked(i))) cands.Add(i);
                 basis = "running logi-sync";
             }
-            else
+            if (cands.Count == 0)
             {
                 string here = At(stayNames, stayCurrent);
                 if (!string.IsNullOrEmpty(here))
@@ -574,6 +611,14 @@ namespace LogiSync
                 List<string> toSend;
                 lock (gate) toSend = policy.Tick(DateTime.UtcNow);
                 foreach (var path in toSend) Follow(path);
+                List<HidppDevice> settled;
+                lock (gate) settled = new List<HidppDevice>(devices.Values);
+                foreach (var d in settled)
+                {
+                    if (d.Marked) continue;
+                    try { if (d.TryMarkIfStable(TimeSpan.FromSeconds(5))) log("marked channel " + (d.CurrentHost + 1) + " as running logi-sync on " + d); }
+                    catch (Exception) { }
+                }
                 FlushLog();
                 Thread.Sleep(150);
             }
@@ -917,6 +962,13 @@ switch ($Command) {
         Check 'mouse pressed on laptop (1->2): keyboard goes to desktop' ($r.ch -eq 2)
         $r = Resolve 0 $N3 $both 0 @('LAPTOP', '', '') $both $true $null
         Check 'partial/garbled names on the gone device: marks still decide' ($r.ch -eq 2)
+
+        # --- reported bug #2: a stray mark on the iPad channel of ONE device
+        $mouseBad = @($true, $true, $true); $kbOk = @($true, $true, $false)
+        $r = Resolve 1 $N3 $kbOk 1 $N3 $mouseBad $false $null
+        Check 'mouse (stray iPad mark) pressed on desktop: keyboard -> laptop, not iPad' ($r.ch -eq 1)
+        $r = Resolve 1 $N3 $mouseBad 1 $N3 $kbOk $true 'IPAD'
+        Check 'keyboard leaves desktop, mouse has stray iPad mark + learned iPad: mouse -> laptop' ($r.ch -eq 1)
 
         # --- before marks exist on other machines (first run)
         $r = Resolve 0 $N3 @($true, $false, $false) 0 $N3 @($true, $false, $false) $true $null

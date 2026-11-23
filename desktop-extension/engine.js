@@ -8,6 +8,8 @@ const UP_BLE = 0xff43;        // Bluetooth-direct HID++ collection
 const UP_RECEIVER = 0xff00;   // Bolt / Unifying receiver HID++ collection
 const R_SHORT = 0x10, R_LONG = 0x11, SW = 0x0e;
 const FEAT_CHANGE_HOST = 0x1814, FEAT_NAME = 0x0005, FEAT_HOSTS_INFO = 0x1815;
+let swSeq = 0;
+const nextSw = () => 2 + (++swSeq & 7);   // ids 2..9
 const MARKER = 0x4c;   // Easy-Switch cookie meaning "logi-sync runs on this channel"
 
 const store = {
@@ -57,20 +59,23 @@ class Link {
     else if (d[1] === 0x8f && d[2] === w.fi && d[3] === w.fsw) done(w.reject, new Error("unreachable (0x" + hex(d[4], 2) + ")"));
   }
 
-  frame(idx, fi, fn, params) {
-    const f = new Uint8Array(19); f[0] = idx; f[1] = fi; f[2] = (fn << 4) | SW;
+  frame(idx, fi, fn, params, sw = SW) {
+    const f = new Uint8Array(19); f[0] = idx; f[1] = fi; f[2] = (fn << 4) | sw;
     if (params) f.set(params.slice(0, 16), 3);
     return f;
   }
 
   request(idx, fi, fn, params = [], timeout = 1500) {
     const run = () => new Promise((resolve, reject) => {
-      const fsw = (fn << 4) | SW;
+      // A different software id per request: a late reply to an earlier
+      // (timed-out) request can't be mistaken for this one's.
+      const sw = nextSw();
+      const fsw = (fn << 4) | sw;
       const timer = setTimeout(() => { this.waiters.delete(idx); reject(new Error("timeout")); }, timeout);
       this.waiters.set(idx, { fi, fsw,
         resolve: (v) => { clearTimeout(timer); resolve(v); },
         reject: (e) => { clearTimeout(timer); reject(e); } });
-      this.hid.sendReport(R_LONG, this.frame(idx, fi, fn, params))
+      this.hid.sendReport(R_LONG, this.frame(idx, fi, fn, params, sw))
         .catch((e) => { clearTimeout(timer); this.waiters.delete(idx); reject(e); });
     });
     const p = (this.queues.get(idx) || Promise.resolve()).then(run, run);
@@ -95,6 +100,7 @@ class Hidpp {
     this.hosts = 0; this.current = -1; this.changeHost = 0;
     this.hostNames = [];   // computer name per channel ("" = empty); [] if unsupported
     this.participants = []; // channels marked as running logi-sync (Easy-Switch cookie)
+    this.connectedAt = Date.now(); this.marked = false;
   }
   get isKeyboard() { return /\bK\d|Keys/i.test(this.name); }
   req(fi, fn, params, t) { return this.link.request(this.index, fi, fn, params, t); }
@@ -114,17 +120,29 @@ class Hidpp {
       const cached = store.get("names:" + this.key, []);
       if (cached.length === this.hosts) this.hostNames = cached;
     }
-    try { await this.markThisHost(); } catch {}
+    try { await this.readMarks(); } catch {}
   }
-  /** CHANGE_HOST fn2 getCookies -> a byte per channel; fn3 setCookie(host, value).
-   *  Mark this channel so every logi-sync can tell which channels run it. */
-  async markThisHost() {
+  /** CHANGE_HOST fn2 getCookies -> a byte per channel; fn3 setCookie(host, value). */
+  async readMarks() {
     const c = [...(await this.req(this.changeHost, 2))];
-    if (this.current >= 0 && c[this.current] !== MARKER) {
-      await this.req(this.changeHost, 3, [this.current, MARKER]);
-      c[this.current] = MARKER;
-    }
     this.participants = c.slice(0, this.hosts).map((v) => v === MARKER);
+    this.marked = !!this.participants[this.current];
+  }
+  /** Mark this channel as running logi-sync, only once the device has stayed
+   *  connected for `stableMs` and still reports the same channel. (While you
+   *  cycle the mouse button it touches each computer briefly and may already
+   *  report the NEXT channel: marking then put a mark on the iPad's channel.)
+   *  Returns true if it wrote the mark. */
+  async tryMarkIfStable(stableMs) {
+    if (this.marked || Date.now() - this.connectedAt < stableMs) return false;
+    const before = this.current;
+    const r = await this.req(this.changeHost, 0);
+    if (r[1] !== before) { this.marked = true; return false; }   // it's leaving; never mark
+    const c = await this.req(this.changeHost, 2);
+    if (c[before] !== MARKER) await this.req(this.changeHost, 3, [before, MARKER]);
+    await this.readMarks();
+    this.marked = true;
+    return true;
   }
   /** HOSTS_INFO 0x1815: fn1 getHostInfo(h) -> [h, status, bus, pages, nameLen, max];
    *  fn3 getHostFriendlyName(h, offset) -> [h, offset, 14 bytes UTF-8]. */
@@ -238,6 +256,7 @@ function resolveTarget(stay, gone, learned) {
       if (marksKnown && !gp[gc]) continue;
       const sc = toStay(gc);
       if (sc < 0) break;
+      if (marksKnown && othersMarked(sp, here) && !sp[sc]) continue;   // both devices must agree
       return { channel: sc + 1, dest: sn[sc] || null, certain: true,
         why: step === 1 ? `mouse moved to the next channel: ${label(sc)}`
                         : `mouse button passes ${step - 1} channel(s) not running logi-sync; next one running it: ${label(sc)}` };
@@ -245,8 +264,16 @@ function resolveTarget(stay, gone, learned) {
   }
   // 2. Candidates: channels running logi-sync, else other paired computers.
   let cands, basis;
-  if (othersMarked(sp, here)) { cands = sp.map((v, i) => (v && i !== here ? i : -1)).filter((i) => i >= 0); basis = "running logi-sync"; }
-  else {
+  // The gone device's mark for the same computer (matched by name when possible).
+  const goneMarked = (sc) => (namesBoth ? !!gp[gn.findIndex((n) => sameName(n, sn[sc]))] : !!gp[sc]);
+  const goneMarksKnown = gone ? othersMarked(gp, gone.current) : false;
+  cands = [];
+  if (othersMarked(sp, here)) {
+    // Both devices must carry the mark: one stray mark can't make a tablet a target.
+    cands = sp.map((v, i) => (v && i !== here && (!goneMarksKnown || goneMarked(i)) ? i : -1)).filter((i) => i >= 0);
+    basis = "running logi-sync";
+  }
+  if (!cands.length) {
     cands = sn[here] ? sn.map((n, i) => i).filter((i) => i !== here && sn[i] && !sameName(sn[i], sn[here])) : [];
     const both = cands.filter((i) => gn.some((n) => sameName(n, sn[i])));
     if (both.length) cands = both;
@@ -351,6 +378,9 @@ async function reconcile() {
     }
     for (const hid of [...links.keys()]) if (!present.includes(hid)) links.delete(hid);
     for (const h of present) if (isHidpp(h) && !links.has(h)) await attach(h);
+    for (const d of [...devices.values()]) {
+      try { if (await d.tryMarkIfStable(5000)) log(`marked channel ${d.current + 1} as running logi-sync on ${d.name}`); } catch {}
+    }
     if (Date.now() - lastReceiverProbe > 10000) {
       lastReceiverProbe = Date.now();
       for (const link of [...links.values()]) {
