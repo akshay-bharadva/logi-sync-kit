@@ -1,0 +1,419 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>logi-sync</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --fg:#1b1f24; --muted:#5f6b7a; --line:#dde2e8; --accent:#2f6fde; --ok:#1f8a4c; --warn:#b4570b; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg:#15181c; --card:#1e2228; --fg:#e7eaee; --muted:#9aa5b2; --line:#2e343c; --accent:#6b9bff; --ok:#4cc47f; --warn:#f0a35a; } }
+  :root[data-theme="dark"] { --bg:#15181c; --card:#1e2228; --fg:#e7eaee; --muted:#9aa5b2; --line:#2e343c; --accent:#6b9bff; --ok:#4cc47f; --warn:#f0a35a; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.45 system-ui, "Segoe UI", sans-serif; }
+  main { max-width:720px; margin:0 auto; padding:24px 16px 48px; }
+  h1 { font-size:22px; margin:0 0 4px; }
+  p.sub { margin:0 0 20px; color:var(--muted); }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:16px; margin-bottom:16px; }
+  .row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+  button { font:inherit; padding:8px 14px; border-radius:8px; border:1px solid var(--line); background:var(--card); color:var(--fg); cursor:pointer; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button:disabled { opacity:.5; cursor:default; }
+  ul.devs { list-style:none; margin:12px 0 0; padding:0; }
+  ul.devs li { padding:8px 0; border-top:1px solid var(--line); display:flex; justify-content:space-between; gap:12px; }
+  ul.devs li:first-child { border-top:0; }
+  .on { color:var(--ok); } .off { color:var(--muted); } .warn { color:var(--warn); }
+  label { color:var(--muted); }
+  select, input { font:inherit; padding:6px 8px; border-radius:6px; border:1px solid var(--line); background:var(--card); color:var(--fg); }
+  pre { margin:0; max-height:280px; overflow:auto; font:12px/1.5 ui-monospace, Consolas, monospace; white-space:pre-wrap; color:var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <h1>logi-sync</h1>
+  <p class="sub">Keep this tab open. When you press Easy-Switch on one device, the other follows.</p>
+
+  <div class="card" id="btwarn" hidden>
+    <strong class="warn">This computer connects to the devices directly over Bluetooth.</strong>
+    The browser forgets such devices each time they switch away, so this page can't follow them back here.
+    On this computer, use <code>logi-sync.ps1</code> instead if PowerShell allows it
+    (<code>$ExecutionContext.SessionState.LanguageMode</code> prints <code>FullLanguage</code>).
+    This page works reliably with a Logitech USB receiver.
+  </div>
+
+  <div class="card" id="unsupported" hidden>
+    <strong class="warn">This browser can't talk to HID devices.</strong>
+    Open this file in Microsoft Edge or Google Chrome. If you're already using one of them, your organisation has turned WebHID off.
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <button class="primary" id="add">Add a device…</button>
+      <span class="off" id="hint">Add your keyboard and your mouse (or your Logitech receiver), one at a time. You only do this once.</span>
+      <button id="diag" style="margin-left:auto">Diagnose…</button>
+    </div>
+    <ul class="devs" id="devs"></ul>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <label for="target">Follow to</label>
+      <select id="target">
+        <option value="0">the other channel (1 ↔ 2)</option>
+        <option value="1">channel 1</option><option value="2">channel 2</option><option value="3">channel 3</option>
+      </select>
+      <label for="delay">after</label>
+      <input id="delay" type="number" min="0.3" max="10" step="0.1" value="1" style="width:5em"> s
+      <label><input type="checkbox" id="enabled" checked> enabled</label>
+    </div>
+    <div class="row" style="margin-top:12px">
+      <span class="off">Send both now:</span>
+      <button data-ch="1">Channel 1</button><button data-ch="2">Channel 2</button><button data-ch="3">Channel 3</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="row" style="margin-bottom:8px">
+      <span class="off" id="checked">starting…</span>
+      <button id="copylog" style="margin-left:auto">Copy log</button>
+    </div>
+    <pre id="log"></pre>
+  </div>
+</main>
+
+<script>
+"use strict";
+const LOGI = 0x046d;
+const UP_BLE = 0xff43;        // Bluetooth-direct HID++ collection
+const UP_RECEIVER = 0xff00;   // Bolt / Unifying receiver HID++ collection
+const R_SHORT = 0x10, R_LONG = 0x11, SW = 0x0e;
+const FEAT_CHANGE_HOST = 0x1814, FEAT_NAME = 0x0005;
+
+const $ = (id) => document.getElementById(id);
+const store = {
+  get(k, d) { try { const v = localStorage.getItem("logi-sync:" + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
+  set(k, v) { try { localStorage.setItem("logi-sync:" + k, JSON.stringify(v)); } catch {} },
+};
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const hex = (n, w = 4) => n.toString(16).padStart(w, "0");
+
+const logLines = store.get("log", []);
+function log(msg) {
+  logLines.unshift(`${new Date().toLocaleString()} ${msg}`);
+  logLines.length = Math.min(logLines.length, 300);
+  store.set("log", logLines);
+  $("log").textContent = logLines.join("\n");
+}
+
+// ----------------------------------------------------------------- link
+// One opened HIDDevice. Bluetooth-direct: a single device at index 0xFF.
+// Receiver: up to 6 paired devices at indices 1..6, plus connect/disconnect
+// notifications (HID++ 1.0 sub-id 0x41).
+class Link {
+  constructor(hid) {
+    this.hid = hid;
+    this.isReceiver = hid.collections.some((c) => c.usagePage === UP_RECEIVER);
+    this.waiters = new Map();  // index -> waiter
+    this.queues = new Map();   // index -> promise chain
+    this.onNotify = null;      // (index, linkUp) for receivers
+    this.handler = (e) => this.handle(e);
+  }
+  async open() { if (!this.hid.opened) await this.hid.open(); this.hid.addEventListener("inputreport", this.handler); }
+
+  handle(e) {
+    if (e.reportId !== R_SHORT && e.reportId !== R_LONG) return;
+    const d = new Uint8Array(e.data.buffer, e.data.byteOffset, e.data.byteLength);
+    const idx = d[0];
+    if (this.isReceiver && e.reportId === R_SHORT && d[1] === 0x41 && this.onNotify) {
+      this.onNotify(idx, (d[3] & 0x40) === 0);   // bit 6 set = link not established
+      return;
+    }
+    const w = this.waiters.get(idx);
+    if (!w) return;
+    const done = (fn, v) => { this.waiters.delete(idx); fn(v); };
+    if (d[1] === w.fi && d[2] === w.fsw) done(w.resolve, d.slice(3));
+    else if (d[1] === 0xff && d[2] === w.fi && d[3] === w.fsw) done(w.reject, new Error("device error 0x" + hex(d[4], 2)));
+    else if (d[1] === 0x8f && d[2] === w.fi && d[3] === w.fsw) done(w.reject, new Error("unreachable (0x" + hex(d[4], 2) + ")"));
+  }
+
+  frame(idx, fi, fn, params) {
+    const f = new Uint8Array(19); f[0] = idx; f[1] = fi; f[2] = (fn << 4) | SW;
+    if (params) f.set(params.slice(0, 16), 3);
+    return f;
+  }
+
+  request(idx, fi, fn, params = [], timeout = 1500) {
+    const run = () => new Promise((resolve, reject) => {
+      const fsw = (fn << 4) | SW;
+      const timer = setTimeout(() => { this.waiters.delete(idx); reject(new Error("timeout")); }, timeout);
+      this.waiters.set(idx, { fi, fsw,
+        resolve: (v) => { clearTimeout(timer); resolve(v); },
+        reject: (e) => { clearTimeout(timer); reject(e); } });
+      this.hid.sendReport(R_LONG, this.frame(idx, fi, fn, params))
+        .catch((e) => { clearTimeout(timer); this.waiters.delete(idx); reject(e); });
+    });
+    const p = (this.queues.get(idx) || Promise.resolve()).then(run, run);
+    this.queues.set(idx, p.catch(() => {}));
+    return p;
+  }
+
+  post(idx, fi, fn, params) { return this.hid.sendReport(R_LONG, this.frame(idx, fi, fn, params)); }
+
+  /** Receiver: turn on wireless connect/disconnect notifications (register 0x00). */
+  enableNotifications() {
+    return this.hid.sendReport(R_SHORT, new Uint8Array([0xff, 0x80, 0x00, 0x00, 0x09, 0x00])).catch(() => {});
+  }
+}
+
+// --------------------------------------------------------------- device
+class Hidpp {
+  constructor(link, index) {
+    this.link = link; this.index = index;
+    this.pid = link.hid.productId;
+    this.key = link.isReceiver ? `rx${hex(this.pid)}:${index}` : `bt${hex(this.pid)}`;
+    this.name = link.hid.productName || "Logitech " + hex(this.pid);
+    this.hosts = 0; this.current = -1; this.changeHost = 0;
+  }
+  get isKeyboard() { return /\bK\d|Keys/i.test(this.name); }
+  req(fi, fn, params, t) { return this.link.request(this.index, fi, fn, params, t); }
+
+  async init() {
+    this.changeHost = await this.featureIndex(FEAT_CHANGE_HOST);
+    const r = await this.req(this.changeHost, 0);
+    this.hosts = r[0]; this.current = r[1];
+    try { this.name = await this.readName(); } catch {}
+  }
+  async featureIndex(id) {
+    const r = await this.req(0, 0, [id >> 8, id & 0xff]);
+    if (!r[0]) throw new Error("feature 0x" + hex(id) + " not supported");
+    return r[0];
+  }
+  async readName() {
+    const fi = await this.featureIndex(FEAT_NAME);
+    const len = (await this.req(fi, 0))[0];
+    let s = "";
+    while (s.length < len) {
+      const c = await this.req(fi, 1, [s.length]);
+      for (let i = 0; i < 16 && s.length < len; i++) s += String.fromCharCode(c[i]);
+    }
+    return s.replace(/\0+$/, "");
+  }
+  /** Fire and forget: the device drops the link while switching. */
+  switchTo(ch) {
+    if (ch < 1 || ch > this.hosts) throw new Error(`${this.name} has ${this.hosts} channels`);
+    return this.link.post(this.index, this.changeHost, 1, [ch - 1]);
+  }
+}
+
+// --------------------------------------------------------------- policy
+// Same rule as logi-sync.ps1: a device that leaves and stays gone for `delay`
+// drags every device still here to the target channel. Nothing happens if no
+// device is left here (sleep, Bluetooth off) or the device comes back in time.
+const devices = new Map();   // key -> Hidpp (connected here, initialised)
+const lostAt = new Map();    // key -> ms
+const delayMs = () => Math.max(300, Number($("delay").value) * 1000);
+
+function onFound(dev) {
+  devices.set(dev.key, dev); lostAt.delete(dev.key);
+  const known = store.get("known", {}); known[dev.key] = dev.name; store.set("known", known);
+  log(`connected: ${dev.name}, channel ${dev.current + 1}/${dev.hosts}`);
+  render();
+}
+
+// follow=false is used when we only notice late (missed event): by then the
+// other device has been in use here, so dragging it away would be wrong.
+function onLost(key, follow = true) {
+  const dev = devices.get(key);
+  if (!dev) return;
+  devices.delete(key);
+  log(follow ? `disconnected: ${dev.name}` : `noticed ${dev.name} is gone (missed event, not following)`);
+  if (follow && devices.size > 0 && $("enabled").checked) {
+    lostAt.set(key, Date.now());
+    setTimeout(tick, delayMs() + 30);
+  }
+  render();
+}
+
+function tick() {
+  const now = Date.now();
+  if (![...lostAt.values()].some((t) => now - t >= delayMs() - 50)) return;
+  lostAt.clear();
+  for (const dev of [...devices.values()]) follow(dev);
+}
+
+const targetFor = (dev) => Number($("target").value) || (dev.current + 1 === 1 ? 2 : 1);
+
+async function follow(dev) {
+  const ch = targetFor(dev);
+  log(`following: sending ${dev.name} to channel ${ch}`);
+  try { await dev.switchTo(ch); } catch (e) { log(`switch failed for ${dev.name}: ${e.message}`); }
+}
+
+async function switchAll(ch) {
+  const list = [...devices.values()].sort((a, b) => a.isKeyboard - b.isKeyboard); // keyboard last
+  for (const d of list) {
+    try { await d.switchTo(ch); log(`sent ${d.name} to channel ${ch}`); } catch (e) { log(`switch failed for ${d.name}: ${e.message}`); }
+    await sleep(50);
+  }
+}
+
+// ------------------------------------------------------------ plumbing
+const links = new Map();       // HIDDevice -> Link
+const isHidpp = (h) => h.vendorId === LOGI && h.collections.some((c) => c.usagePage === UP_BLE || c.usagePage === UP_RECEIVER);
+const pending = new Set();
+
+async function attachDevice(link, index, attempts = 5) {
+  const probe = new Hidpp(link, index);
+  if (devices.has(probe.key) || pending.has(probe.key)) return;
+  pending.add(probe.key);
+  try {
+    for (let i = 0; i < attempts; i++) {
+      try { await probe.init(); onFound(probe); return; }
+      catch (e) {
+        if (/not supported/.test(e.message)) { if (!link.isReceiver) log(`${probe.name}: no Easy-Switch, ignored`); return; }
+        if (link.isReceiver && /unreachable/.test(e.message)) return;   // empty slot or device away
+        await sleep(700);  // a device that just connected is often busy for a moment
+      }
+    }
+    if (!link.isReceiver) log(`${probe.name} not answering yet, will retry`);
+  } finally { pending.delete(probe.key); }
+}
+
+async function attach(hid) {
+  if (!isHidpp(hid) || links.has(hid)) return;
+  const link = new Link(hid);
+  links.set(hid, link);
+  try { await link.open(); } catch (e) { links.delete(hid); log(`could not open ${hid.productName}: ${e.message}`); return; }
+  if (!link.isReceiver) {
+    // Bluetooth-direct devices report no serial number, so the browser only
+    // keeps permission while they are connected: after an Easy-Switch away
+    // they are invisible here until re-added. Point to logi-sync.ps1 instead.
+    $("btwarn").hidden = false;
+    await attachDevice(link, 0xff);
+    if (!devices.has(`bt${hex(hid.productId)}`)) dropLink(hid);   // retried by reconcile()
+    return;
+  }
+  log(`receiver found: ${hid.productName || hex(hid.productId)}`);
+  link.onNotify = (idx, up) => {
+    if (up) setTimeout(() => attachDevice(link, idx), 300);
+    else onLost(`rx${hex(hid.productId)}:${idx}`);
+  };
+  await link.enableNotifications();
+  for (let idx = 1; idx <= 6; idx++) await attachDevice(link, idx, 2);
+}
+
+function dropLink(hid) {
+  const link = links.get(hid);
+  if (link) hid.removeEventListener("inputreport", link.handler);
+  links.delete(hid);
+  hid.close().catch(() => {});
+}
+
+function detach(hid) {
+  const link = links.get(hid);
+  if (!link) return;
+  links.delete(hid);
+  for (const dev of [...devices.values()]) if (dev.link === link) onLost(dev.key);
+}
+
+function render() {
+  const ul = $("devs"); ul.innerHTML = "";
+  const known = store.get("known", {});
+  for (const [key, name] of Object.entries(known)) {
+    const d = devices.get(key);
+    const li = document.createElement("li");
+    li.innerHTML = `<span></span><span class="${d ? "on" : "off"}"></span>`;
+    li.children[0].textContent = d ? d.name : name;
+    li.children[1].textContent = d ? `here · channel ${d.current + 1} of ${d.hosts}` : "not connected here";
+    ul.appendChild(li);
+  }
+  $("hint").hidden = Object.keys(known).length >= 2;
+}
+
+// Self-healing: browsers can drop or delay HID events (background tabs,
+// sleeping tabs, a device that was busy when it reconnected). Re-check the
+// real state periodically and whenever the tab becomes visible again.
+let reconciling = false, lastReceiverProbe = 0;
+async function reconcile(reason) {
+  if (reconciling) return;
+  reconciling = true;
+  try {
+    const present = await navigator.hid.getDevices();
+    // Devices whose HIDDevice disappeared without a disconnect event.
+    for (const dev of [...devices.values()]) {
+      if (!present.includes(dev.link.hid) || !dev.link.hid.opened) onLost(dev.key, false);
+    }
+    for (const hid of [...links.keys()]) if (!present.includes(hid)) links.delete(hid);
+    // Devices that are here but that we don't know about (missed connect, failed setup).
+    for (const h of present) if (isHidpp(h) && !links.has(h)) await attach(h);
+    // Receivers: look for paired devices that came back without a notification.
+    if (Date.now() - lastReceiverProbe > 10000) {
+      lastReceiverProbe = Date.now();
+      for (const link of [...links.values()]) {
+        if (!link.isReceiver) continue;
+        for (let idx = 1; idx <= 6; idx++) await attachDevice(link, idx, 1);
+      }
+    }
+    $("checked").textContent = `checked ${new Date().toLocaleTimeString()}` + (reason ? ` (${reason})` : "");
+  } catch (e) {
+    log("re-check failed: " + e.message);
+  } finally { reconciling = false; }
+}
+
+async function diagnose() {
+  // Lists any HID device the browser can see, unfiltered, so we can tell
+  // what a given computer's dongle looks like.
+  try {
+    const picked = await navigator.hid.requestDevice({ filters: [] });
+    for (const h of picked) {
+      const cols = h.collections.map((c) => `${hex(c.usagePage)}:${hex(c.usage)}`).join(", ");
+      log(`diagnose: "${h.productName}" vid ${hex(h.vendorId)} pid ${hex(h.productId)} collections [${cols}]`);
+    }
+    if (!picked.length) log("diagnose: nothing picked");
+  } catch (e) { log("diagnose failed: " + e.message); }
+}
+
+async function init() {
+  if (!("hid" in navigator)) { $("unsupported").hidden = false; $("add").disabled = true; return; }
+  $("target").value = String(store.get("target", 0));
+  $("delay").value = String(store.get("delay", 1));
+  $("target").onchange = () => store.set("target", Number($("target").value));
+  $("delay").onchange = () => store.set("delay", Number($("delay").value));
+  document.querySelectorAll("button[data-ch]").forEach((b) => (b.onclick = () => switchAll(Number(b.dataset.ch))));
+  $("diag").onclick = diagnose;
+  $("copylog").onclick = async () => {
+    try { await navigator.clipboard.writeText(logLines.join("\n")); $("copylog").textContent = "Copied"; }
+    catch { $("copylog").textContent = "Copy failed"; }
+    setTimeout(() => ($("copylog").textContent = "Copy log"), 1500);
+  };
+  $("log").textContent = logLines.join("\n");
+
+  $("add").onclick = async () => {
+    try {
+      const picked = await navigator.hid.requestDevice({ filters: [
+        { vendorId: LOGI, usagePage: UP_BLE },
+        { vendorId: LOGI, usagePage: UP_RECEIVER },
+      ] });
+      for (const h of picked) await attach(h);
+      render();
+    } catch (e) { log("add failed: " + e.message); }
+  };
+
+  navigator.hid.addEventListener("connect", (e) => attach(e.device));
+  navigator.hid.addEventListener("disconnect", (e) => detach(e.device));
+
+  // Ask the browser not to freeze this tab while it is in the background.
+  if (navigator.locks) navigator.locks.request("logi-sync-keepalive", () => new Promise(() => {}));
+
+  for (const h of await navigator.hid.getDevices()) await attach(h);
+  render();
+  log(`logi-sync ready (${devices.size} device(s) here)`);
+
+  setInterval(() => reconcile(), 5000);
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) reconcile("tab visible"); });
+  document.addEventListener("resume", () => reconcile("tab resumed"));   // after the browser froze the tab
+  window.addEventListener("pageshow", () => reconcile());
+}
+init();
+</script>
+</body>
+</html>

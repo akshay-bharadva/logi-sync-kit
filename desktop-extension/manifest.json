@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "logi-sync",
+  "version": "1.0.0",
+  "description": "Keeps a Logitech keyboard and mouse on the same Easy-Switch channel. When one switches away, the other follows.",
+  "minimum_chrome_version": "116",
+  "permissions": ["offscreen", "alarms"],
+  "background": { "service_worker": "sw.js" },
+  "action": { "default_title": "logi-sync" },
+  "options_page": "options.html"
+}
