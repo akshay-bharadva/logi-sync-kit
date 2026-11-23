@@ -99,9 +99,19 @@ Any device can lead in either direction.
   **if one device leaves and stays gone for 1 second while the other is still
   here, the other is sent to the same place** with Logitech's HID++ *ChangeHost*
   command.
-- "The same place" is the *other* channel: computers on channel 1 send to 2, and
-  computers on channel 2 send to 1. Change it in the extension's settings page,
-  or with `-Target 3` for the script.
+- **"The same place" is worked out by computer name, not channel number.** Each
+  device remembers the name of the computer on each of its channels, and
+  logi-sync reads those names:
+  - **The mouse leads:** its button cycles to the next channel, so we know exactly
+    which computer it went to. The keyboard goes to the channel with that name.
+  - **The keyboard leads:** the mouse goes to the other computer both devices are
+    paired with. If there are several (an iPad on channel 3, say), it picks the one
+    used last time. With no history yet, it picks the lowest other channel.
+  - Any channel layout works, including the keyboard and mouse numbering the same
+    computer differently.
+  - To pin a fixed channel instead, use the extension's **Follow to** setting or the
+    script's `-Target 3`.
+  - `logi-sync.ps1 status` shows each device's channels and computer names.
 - Nothing happens if **both** devices drop at once (sleep, Bluetooth off), or if
   the device comes back within the second.
 - Both halves re-check the real device state every few seconds, so a missed event
@@ -111,8 +121,8 @@ Any device can lead in either direction.
 
 - **Turning a device off** looks the same as switching it away, so the other one
   follows. On the laptop, run `stop` first if you do this on purpose.
-- With **three** computers, the follower can't know which channel the first device
-  went to. It goes to the configured target.
+- With **three or more** computers, a **keyboard**-led switch is a best guess:
+  the most recently used other computer. Mouse-led switches are exact.
 - The **extension needs a USB receiver** on that computer. With direct Bluetooth,
   the browser forgets the device each time it switches away, because those devices
   report no serial number. The extension shows a warning if that's the case. Use

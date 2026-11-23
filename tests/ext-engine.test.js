@@ -11,9 +11,17 @@ const engineSrc = fs.readFileSync(path.join(__dirname, "..", "desktop-extension"
 
 /** A HID++ 2.0 device answering on `idx`: ChangeHost at feature 10, name at 5. */
 class FakeDev {
-  constructor(name, host = 0) { this.name = name; this.host = host; this.switchedTo = null; this.online = true; this.busy = 0; }
+  constructor(name, host = 0, hostNames = null) { this.name = name; this.host = host; this.hostNames = hostNames; this.switchedTo = null; this.online = true; this.busy = 0; }
   answer(fi, fn, data) {
-    if (fi === 0 && fn === 0) { const id = (data[3] << 8) | data[4]; return [id === 0x1814 ? 10 : id === 0x0005 ? 5 : 0]; }
+    if (fi === 0 && fn === 0) {
+      const id = (data[3] << 8) | data[4];
+      return [id === 0x1814 ? 10 : id === 0x0005 ? 5 : id === 0x1815 && this.hostNames ? 11 : 0];
+    }
+    if (fi === 11 && fn === 1) return [data[3], 1, 4, 1, Buffer.byteLength(this.hostNames[data[3]] || ""), 24];
+    if (fi === 11 && fn === 3) {
+      const b = Buffer.from(this.hostNames[data[3]] || "", "utf8").subarray(data[4], data[4] + 14);
+      return [data[3], data[4], ...b];
+    }
     if (fi === 10 && fn === 0) return [3, this.host];
     if (fi === 10 && fn === 1) { this.switchedTo = data[3] + 1; return null; }
     if (fi === 5 && fn === 0) return [this.name.length];
@@ -65,7 +73,7 @@ function startEngine(present) {
     fire(t, device) { hidListeners[t].forEach((f) => f({ device })); },
   };
   const ctx = {
-    console, setTimeout, clearTimeout, setInterval, Date, Promise, Map, Set, Uint8Array, DataView, JSON, Math, Number, String, Error, Object,
+    console, setTimeout, clearTimeout, setInterval, Date, Promise, Map, Set, Uint8Array, DataView, JSON, Math, Number, String, Error, Object, TextDecoder,
     localStorage: { getItem: (k) => (k in storage ? storage[k] : null), setItem: (k, v) => (storage[k] = String(v)) },
     navigator: { hid },
     BroadcastChannel: FakeBC,
@@ -77,6 +85,7 @@ function startEngine(present) {
     hid,
     log: () => (get("log") || []).join("\n"),
     state: () => get("state"),
+    storage,
     send: (msg) => channels.forEach((c) => c.onmessage && c.onmessage({ data: msg })),
   };
 }
@@ -151,6 +160,42 @@ async function test(name, fn) {
     e.send({ cmd: "switch", ch: 1 });
     await wait(400);
     assert.strictEqual(kb.switchedTo, 1); assert.strictEqual(ms.switchedTo, 1);
+  });
+
+  const HOSTS = ["HOME-LAPTOP", "WORK-DESKTOP", "Samâ€™s iPad"];
+
+  await test("names: computer names read (incl. non-ASCII)", async () => {
+    const kb = new FakeDev("Signature Slim K950", 1, HOSTS), ms = new FakeDev("Signature Plus M750 L", 1, HOSTS);
+    const rx = new FakeHid(0xc548, "USB Receiver", 0xff00, new Map([[1, kb], [2, ms]]));
+    const e = startEngine([rx]);
+    await wait(1500);
+    rx.link(2, false);                                       // mouse leaves desktop (ch2) -> cycled to ch3
+    await wait(1300);
+    assert.strictEqual(kb.switchedTo, 3, e.log());
+    assert.match(e.log(), /next channel: Samâ€™s iPad/, e.log());
+  });
+
+  await test("names: mismatched channel numbers resolved by name", async () => {
+    // keyboard: desktop on 2, laptop on 1; mouse: desktop on 3, laptop on 1
+    const kb = new FakeDev("Signature Slim K950", 1, ["LAPTOP", "DESKTOP", ""]);
+    const ms = new FakeDev("Signature Plus M750 L", 2, ["LAPTOP", "", "DESKTOP"]);
+    const rx = new FakeHid(0xc548, "USB Receiver", 0xff00, new Map([[1, kb], [2, ms]]));
+    const e = startEngine([rx]);
+    await wait(1500);
+    rx.link(2, false);                                       // mouse leaves desktop: mouse ch3 -> next is ch1 = LAPTOP
+    await wait(1300);
+    assert.strictEqual(kb.switchedTo, 1, e.log());           // keyboard's LAPTOP is channel 1
+  });
+
+  await test("names: keyboard leads with 2 other computers -> uses history", async () => {
+    const kb = new FakeDev("Signature Slim K950", 0, HOSTS), ms = new FakeDev("Signature Plus M750 L", 0, HOSTS);
+    const rx = new FakeHid(0xc548, "USB Receiver", 0xff00, new Map([[1, kb], [2, ms]]));
+    const e = startEngine([rx]);
+    e.storage["logi-sync:lastComputer"] = JSON.stringify(HOSTS[2]);
+    await wait(1500);
+    rx.link(1, false);
+    await wait(1300);
+    assert.strictEqual(ms.switchedTo, 3, e.log());
   });
 
   await test("bluetooth-direct device flags the warning", async () => {

@@ -7,7 +7,7 @@ const LOGI = 0x046d;
 const UP_BLE = 0xff43;        // Bluetooth-direct HID++ collection
 const UP_RECEIVER = 0xff00;   // Bolt / Unifying receiver HID++ collection
 const R_SHORT = 0x10, R_LONG = 0x11, SW = 0x0e;
-const FEAT_CHANGE_HOST = 0x1814, FEAT_NAME = 0x0005;
+const FEAT_CHANGE_HOST = 0x1814, FEAT_NAME = 0x0005, FEAT_HOSTS_INFO = 0x1815;
 
 const store = {
   get(k, d) { try { const v = localStorage.getItem("logi-sync:" + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
@@ -92,6 +92,7 @@ class Hidpp {
     this.key = link.isReceiver ? `rx${hex(this.pid)}:${index}` : `bt${hex(this.pid)}`;
     this.name = link.hid.productName || "Logitech " + hex(this.pid);
     this.hosts = 0; this.current = -1; this.changeHost = 0;
+    this.hostNames = [];   // computer name per channel ("" = empty); [] if unsupported
   }
   get isKeyboard() { return /\bK\d|Keys/i.test(this.name); }
   req(fi, fn, params, t) { return this.link.request(this.index, fi, fn, params, t); }
@@ -101,6 +102,24 @@ class Hidpp {
     const r = await this.req(this.changeHost, 0);
     this.hosts = r[0]; this.current = r[1];
     try { this.name = await this.readName(); } catch {}
+    try { this.hostNames = await this.readHostNames(); } catch { this.hostNames = []; }
+  }
+  /** HOSTS_INFO 0x1815: fn1 getHostInfo(h) -> [h, status, bus, pages, nameLen, max];
+   *  fn3 getHostFriendlyName(h, offset) -> [h, offset, 14 bytes UTF-8]. */
+  async readHostNames() {
+    const fi = await this.featureIndex(FEAT_HOSTS_INFO);
+    const names = [];
+    for (let h = 0; h < this.hosts; h++) {
+      const len = (await this.req(fi, 1, [h]))[4];
+      const bytes = [];
+      while (bytes.length < len) {
+        const r = await this.req(fi, 3, [h, bytes.length]);
+        const take = Math.min(14, len - bytes.length);
+        for (let i = 0; i < take; i++) bytes.push(r[2 + i]);
+      }
+      names.push(new TextDecoder().decode(new Uint8Array(bytes)).replace(/\0+$/, "").trim());
+    }
+    return names;
   }
   async featureIndex(id) {
     const r = await this.req(0, 0, [id >> 8, id & 0xff]);
@@ -152,6 +171,7 @@ function onLost(key, follow = true) {
   const dev = devices.get(key);
   if (!dev) return;
   devices.delete(key);
+  lastGone = dev;
   log(follow ? `disconnected: ${dev.name}` : `noticed ${dev.name} is gone (missed event, not following)`);
   const s = settings();
   if (follow && devices.size > 0 && s.enabled) {
@@ -168,11 +188,44 @@ function tick() {
   for (const dev of [...devices.values()]) follow(dev);
 }
 
-const targetFor = (dev) => settings().target || (dev.current + 1 === 1 ? 2 : 1);
+
+// Name-based target: which channel (in the STAYING device's numbering) holds
+// the computer the other device just went to. Mirrors FollowPolicy.ResolveTarget
+// in logi-sync.ps1.
+const sameName = (a, b) => !!a && !!b && a.trim().toLowerCase() === b.trim().toLowerCase();
+function resolveTarget(stay, gone, learned) {
+  const names = stay.hostNames || [], here = names[stay.current];
+  const other12 = { channel: stay.current + 1 === 1 ? 2 : 1, dest: null };
+  if (!here) return { ...other12, why: "device doesn't report computer names: other of 1/2" };
+  // 1. Mouse buttons cycle to the next channel, so we know exactly where it went.
+  if (gone && !gone.isKeyboard && gone.hosts > 0 && gone.current >= 0) {
+    const next = (gone.hostNames || [])[(gone.current + 1) % gone.hosts];
+    const i = names.findIndex((n, j) => j !== stay.current && sameName(n, next) && !sameName(next, here));
+    if (i >= 0) return { channel: i + 1, dest: names[i], why: `mouse button moves to the next channel: ${names[i]}` };
+  }
+  // 2. Other computers this device knows, preferring ones the other device knows too.
+  let cands = names.map((n, i) => i).filter((i) => i !== stay.current && names[i] && !sameName(names[i], here));
+  const goneNames = (gone && gone.hostNames) || [];
+  const both = cands.filter((i) => goneNames.some((n) => sameName(n, names[i])));
+  if (both.length) cands = both;
+  if (!cands.length) return { ...other12, why: "no other computer paired: other of 1/2" };
+  if (cands.length === 1) return { channel: cands[0] + 1, dest: names[cands[0]], why: `the only other computer: ${names[cands[0]]}` };
+  const l = cands.find((i) => sameName(names[i], learned));
+  if (l !== undefined) return { channel: l + 1, dest: names[l], why: `where you went last time: ${names[l]}` };
+  return { channel: cands[0] + 1, dest: names[cands[0]], why: `lowest other channel (no history yet): ${names[cands[0]]}` };
+}
+let lastGone = null;   // the device that most recently left (keeps its channel table)
+function targetFor(dev) {
+  const fixed = settings().target;
+  if (fixed) return { channel: fixed, why: "fixed target" };
+  const r = resolveTarget(dev, lastGone, store.get("lastComputer", null));
+  if (r.dest) store.set("lastComputer", r.dest);
+  return r;
+}
 
 async function follow(dev) {
-  const ch = targetFor(dev);
-  log(`following: sending ${dev.name} to channel ${ch}`);
+  const { channel: ch, why } = targetFor(dev);
+  log(`following: sending ${dev.name} to channel ${ch} (${why})`);
   try { await dev.switchTo(ch); } catch (e) { log(`switch failed for ${dev.name}: ${e.message}`); }
 }
 

@@ -179,7 +179,9 @@ namespace LogiSync
     public class HidppDevice : IDisposable
     {
         const byte LongReport = 0x11, DevIndex = 0xFF, SwId = 0x0D;
-        public const ushort FeatRoot = 0x0000, FeatDeviceName = 0x0005, FeatChangeHost = 0x1814;
+        public const ushort FeatRoot = 0x0000, FeatDeviceName = 0x0005, FeatChangeHost = 0x1814, FeatHostsInfo = 0x1815;
+        /// Name of the computer paired on each channel ("" = empty channel). Empty array if unsupported.
+        public string[] HostNames = new string[0];
 
         public readonly string Path;
         public readonly ushort Pid;
@@ -291,6 +293,29 @@ namespace LogiSync
                 Name = sb.ToString().TrimEnd('\0');
             }
             catch (HidppException) { Name = "Logitech " + Pid.ToString("x4"); }
+            try { HostNames = ReadHostNames(); } catch (HidppException) { HostNames = new string[0]; }
+        }
+
+        /// HOSTS_INFO (0x1815): fn1 getHostInfo(host) -> [host, status, bus, pages, nameLen, nameMax];
+        /// fn3 getHostFriendlyName(host, offset) -> [host, offset, 14 bytes of UTF-8 name].
+        string[] ReadHostNames()
+        {
+            byte fi = FeatureIndex(FeatHostsInfo);
+            var names = new string[HostCount];
+            for (int h = 0; h < HostCount; h++)
+            {
+                int len = Request(fi, 1, new byte[] { (byte)h }, 1500)[4];
+                var bytes = new List<byte>();
+                while (bytes.Count < len)
+                {
+                    var r = Request(fi, 3, new byte[] { (byte)h, (byte)bytes.Count }, 1500);
+                    int take = Math.Min(14, len - bytes.Count);
+                    if (take <= 0) break;
+                    for (int i = 0; i < take; i++) bytes.Add(r[2 + i]);
+                }
+                names[h] = Encoding.UTF8.GetString(bytes.ToArray()).TrimEnd('\0').Trim();
+            }
+            return names;
         }
 
         public void RefreshHost()
@@ -307,7 +332,7 @@ namespace LogiSync
         }
 
         /// Logitech keyboard model names carry a K-number (K950, MX Keys = K-series pid ranges aside).
-        public bool IsKeyboard { get { return Regex.IsMatch(Name, @"K\d") || Name.IndexOf("Keys", StringComparison.OrdinalIgnoreCase) >= 0; } }
+        public bool IsKeyboard { get { return Regex.IsMatch(Name, @"\bK\d") || Name.IndexOf("Keys", StringComparison.OrdinalIgnoreCase) >= 0; } }
 
         public void Dispose() { try { fs.Dispose(); } catch { } }
         public override string ToString() { return Name + " (pid " + Pid.ToString("x4") + ")"; }
@@ -346,6 +371,70 @@ namespace LogiSync
         }
 
         public static int AutoTarget(int thisChannel) { return thisChannel == 1 ? 2 : 1; }
+
+        static bool Same(string a, string b)
+        {
+            return !string.IsNullOrEmpty(a) && !string.IsNullOrEmpty(b) &&
+                string.Equals(a.Trim(), b.Trim(), StringComparison.OrdinalIgnoreCase);
+        }
+
+        static string At(string[] a, int i) { return (a != null && i >= 0 && i < a.Length) ? a[i] : null; }
+
+        /// Decide which channel (1-based, in the STAYING device's numbering) to send
+        /// the staying device to, by computer name rather than channel number.
+        ///   stay*: the device still here.  gone*: the device that just left.
+        ///   learned: name of the computer chosen last time (tie-breaker), may be null.
+        /// Returns the channel; `dest` is the chosen computer's name (null if unknown).
+        public static int ResolveTarget(int stayCurrent, string[] stayNames,
+            int goneCurrent, string[] goneNames, int goneHostCount, bool goneIsKeyboard,
+            string learned, out string dest, out string why)
+        {
+            dest = null;
+            string here = At(stayNames, stayCurrent);
+            if (string.IsNullOrEmpty(here))
+            {
+                why = "device doesn't report computer names: other of 1/2";
+                return AutoTarget(stayCurrent + 1);
+            }
+
+            // 1. Mouse buttons cycle to the next channel, so we know exactly where it went.
+            if (!goneIsKeyboard && goneHostCount > 0 && goneCurrent >= 0)
+            {
+                string next = At(goneNames, (goneCurrent + 1) % goneHostCount);
+                for (int i = 0; i < stayNames.Length; i++)
+                    if (i != stayCurrent && Same(stayNames[i], next) && !Same(next, here))
+                    {
+                        dest = stayNames[i];
+                        why = "mouse button moves to the next channel: " + dest;
+                        return i + 1;
+                    }
+            }
+
+            // 2. Other computers this device knows, preferring ones the other device knows too.
+            var cands = new List<int>();
+            for (int i = 0; i < stayNames.Length; i++)
+                if (i != stayCurrent && !string.IsNullOrEmpty(stayNames[i]) && !Same(stayNames[i], here)) cands.Add(i);
+            if (goneNames != null && goneNames.Length > 0)
+            {
+                var both = cands.FindAll(i => Array.Exists(goneNames, n => Same(n, stayNames[i])));
+                if (both.Count > 0) cands = both;
+            }
+            if (cands.Count == 0)
+            {
+                why = "no other computer paired: other of 1/2";
+                return AutoTarget(stayCurrent + 1);
+            }
+            int pick = cands[0];
+            if (cands.Count == 1) why = "the only other computer: " + stayNames[pick];
+            else
+            {
+                int l = cands.FindIndex(i => Same(stayNames[i], learned));
+                if (l >= 0) { pick = cands[l]; why = "where you went last time: " + stayNames[pick]; }
+                else why = "lowest other channel (no history yet): " + stayNames[pick];
+            }
+            dest = stayNames[pick];
+            return pick + 1;
+        }
     }
 
     // -------------------------------------------------------------- engine
@@ -358,6 +447,12 @@ namespace LogiSync
         readonly Dictionary<string, HidppDevice> devices = new Dictionary<string, HidppDevice>();
         readonly HashSet<string> ignored = new HashSet<string>();   // HID++ but not multi-host
         readonly object gate = new object();
+        HidppDevice lastGone;                                        // the device that most recently left
+        static readonly string LearnedFile = System.IO.Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "logi-sync", "last-computer.txt");
+
+        static string LoadLearned() { try { return File.ReadAllText(LearnedFile).Trim(); } catch { return null; } }
+        static void SaveLearned(string name) { try { if (!string.IsNullOrEmpty(name)) File.WriteAllText(LearnedFile, name); } catch { } }
         public volatile bool Stop;
 
         public Engine(int target, double delaySeconds, Action<string> log)
@@ -427,6 +522,7 @@ namespace LogiSync
                 if (!devices.TryGetValue(dev.Path, out cur) || cur != dev) return;
                 devices.Remove(dev.Path);
                 policy.Lost(dev.Path, DateTime.UtcNow);
+                lastGone = dev;   // keep its channel table: it tells us where it may have gone
             }
             dev.Dispose();
             log("disconnected: " + dev);
@@ -437,10 +533,21 @@ namespace LogiSync
             HidppDevice dev;
             lock (gate) if (!devices.TryGetValue(path, out dev)) return;
             int channel = target;
-            if (channel == 0) channel = FollowPolicy.AutoTarget(dev.CurrentHost + 1);
+            string why = "fixed target";
+            if (channel == 0)
+            {
+                HidppDevice gone;
+                lock (gate) gone = lastGone;
+                string dest;
+                channel = FollowPolicy.ResolveTarget(dev.CurrentHost, dev.HostNames,
+                    gone != null ? gone.CurrentHost : -1, gone != null ? gone.HostNames : null,
+                    gone != null ? gone.HostCount : 0, gone != null && gone.IsKeyboard,
+                    LoadLearned(), out dest, out why);
+                SaveLearned(dest);
+            }
             try
             {
-                log("following: sending " + dev + " to channel " + channel);
+                log("following: sending " + dev + " to channel " + channel + " (" + why + ")");
                 dev.SwitchTo(channel);
             }
             catch (Exception e) { log("switch failed for " + dev + ": " + e.Message); }
@@ -479,6 +586,8 @@ namespace LogiSync
                     {
                         d.Initialize();
                         lines.Add(d + ": channel " + (d.CurrentHost + 1) + " of " + d.HostCount);
+                        for (int h = 0; h < d.HostNames.Length; h++)
+                            lines.Add("    " + (h + 1) + ": " + (d.HostNames[h].Length > 0 ? d.HostNames[h] : "(empty)") + (h == d.CurrentHost ? "  <- this computer" : ""));
                     }
                 }
                 catch (Exception e) { lines.Add("pid " + ep.Pid.ToString("x4") + ": " + e.Message); }
@@ -682,6 +791,35 @@ switch ($Command) {
 
         Check 'auto target 1 -> 2' ([LogiSync.FollowPolicy]::AutoTarget(1) -eq 2)
         Check 'auto target 2 -> 1' ([LogiSync.FollowPolicy]::AutoTarget(2) -eq 1)
+
+        # Name-based target resolution. ResolveTarget(stayCur, stayNames, goneCur, goneNames, goneCount, goneIsKb, learned, [ref]dest, [ref]why)
+        function Resolve($stayCur, $stayNames, $goneCur, $goneNames, $goneIsKb, $learned) {
+            $d = $null; $w = $null
+            $count = 0; if ($goneNames) { $count = $goneNames.Count }
+            $ch = [LogiSync.FollowPolicy]::ResolveTarget($stayCur, [string[]]$stayNames, $goneCur, [string[]]$goneNames, $count, $goneIsKb, $learned, [ref]$d, [ref]$w)
+            return @{ ch = $ch; dest = $d; why = $w }
+        }
+        $std = @('LAPTOP', 'DESKTOP', '')
+        $r = Resolve 0 $std 0 $std $true $null
+        Check 'kb leaves, 2 computers: mouse -> desktop (ch2)' ($r.ch -eq 2 -and $r.dest -eq 'DESKTOP')
+        $r = Resolve 1 $std 1 $std $true $null
+        Check 'on desktop: mouse -> laptop (ch1)' ($r.ch -eq 1)
+        $r = Resolve 0 @('LAPTOP', '', 'DESKTOP') 0 @('LAPTOP', '', 'DESKTOP') $true $null
+        Check 'desktop on channel 3: -> ch3' ($r.ch -eq 3)
+        $r = Resolve 0 @('LAPTOP', 'DESKTOP', '') 1 @('IPAD', 'LAPTOP', 'DESKTOP') $true $null
+        Check 'mismatched numbering: by name, not number' ($r.ch -eq 2 -and $r.dest -eq 'DESKTOP')
+        $r = Resolve 0 @('LAPTOP', 'DESKTOP', 'IPAD') 0 @('LAPTOP', 'DESKTOP', 'IPAD') $false $null
+        Check 'mouse leaves from ch1: went to ch2 (cycle) -> desktop' ($r.ch -eq 2)
+        $r = Resolve 1 @('LAPTOP', 'DESKTOP', 'IPAD') 1 @('LAPTOP', 'DESKTOP', 'IPAD') $false $null
+        Check 'mouse leaves from ch2: went to ch3 (cycle) -> ipad' ($r.ch -eq 3)
+        $r = Resolve 0 @('LAPTOP', 'DESKTOP', 'IPAD') 0 @('LAPTOP', 'DESKTOP', 'IPAD') $true $null
+        Check 'kb leaves, 2 candidates, no history: lowest other (desktop)' ($r.ch -eq 2)
+        $r = Resolve 0 @('LAPTOP', 'DESKTOP', 'IPAD') 0 @('LAPTOP', 'DESKTOP', 'IPAD') $true 'IPAD'
+        Check 'kb leaves, 2 candidates, history says ipad: -> ch3' ($r.ch -eq 3)
+        $r = Resolve 0 @('LAPTOP', 'DESKTOP', 'IPAD') 0 @('LAPTOP', 'DESKTOP', '') $true 'IPAD'
+        Check 'prefer computer both devices know (ipad only on mouse)' ($r.ch -eq 2)
+        $r = Resolve 0 @() 0 @() $true $null
+        Check 'no names reported: fallback 1 <-> 2' ($r.ch -eq 2)
         if ($fail) { Write-Host "$fail check(s) failed"; exit 1 } else { Write-Host 'all checks passed' }
     }
 }
