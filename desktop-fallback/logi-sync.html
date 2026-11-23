@@ -87,6 +87,7 @@ const UP_BLE = 0xff43;        // Bluetooth-direct HID++ collection
 const UP_RECEIVER = 0xff00;   // Bolt / Unifying receiver HID++ collection
 const R_SHORT = 0x10, R_LONG = 0x11, SW = 0x0e;
 const FEAT_CHANGE_HOST = 0x1814, FEAT_NAME = 0x0005, FEAT_HOSTS_INFO = 0x1815;
+const MARKER = 0x4c;   // Easy-Switch cookie meaning "logi-sync runs on this channel"
 
 const $ = (id) => document.getElementById(id);
 const store = {
@@ -173,6 +174,7 @@ class Hidpp {
     this.name = link.hid.productName || "Logitech " + hex(this.pid);
     this.hosts = 0; this.current = -1; this.changeHost = 0;
     this.hostNames = [];   // computer name per channel ("" = empty); [] if unsupported
+    this.participants = []; // channels marked as running logi-sync (Easy-Switch cookie)
   }
   get isKeyboard() { return /\bK\d|Keys/i.test(this.name); }
   req(fi, fn, params, t) { return this.link.request(this.index, fi, fn, params, t); }
@@ -182,7 +184,27 @@ class Hidpp {
     const r = await this.req(this.changeHost, 0);
     this.hosts = r[0]; this.current = r[1];
     try { this.name = await this.readName(); } catch {}
-    try { this.hostNames = await this.readHostNames(); } catch { this.hostNames = []; }
+    // Right after a reconnect the device is busy, so retry and fall back to the last good read.
+    for (let a = 0; a < 3 && !this.hostNames.length; a++) {
+      try { this.hostNames = await this.readHostNames(); }
+      catch (e) { if (/not supported/.test(e.message)) break; await sleep(400); }   // retry only if busy
+    }
+    if (this.hostNames.length) store.set("names:" + this.key, this.hostNames);
+    else {
+      const cached = store.get("names:" + this.key, []);
+      if (cached.length === this.hosts) this.hostNames = cached;
+    }
+    try { await this.markThisHost(); } catch {}
+  }
+  /** CHANGE_HOST fn2 getCookies -> a byte per channel; fn3 setCookie(host, value).
+   *  Mark this channel so every logi-sync can tell which channels run it. */
+  async markThisHost() {
+    const c = [...(await this.req(this.changeHost, 2))];
+    if (this.current >= 0 && c[this.current] !== MARKER) {
+      await this.req(this.changeHost, 3, [this.current, MARKER]);
+      c[this.current] = MARKER;
+    }
+    this.participants = c.slice(0, this.hosts).map((v) => v === MARKER);
   }
   /** HOSTS_INFO 0x1815: fn1 getHostInfo(h) -> [h, status, bus, pages, nameLen, max];
    *  fn3 getHostFriendlyName(h, offset) -> [h, offset, 14 bytes UTF-8]. */
@@ -190,10 +212,14 @@ class Hidpp {
     const fi = await this.featureIndex(FEAT_HOSTS_INFO);
     const names = [];
     for (let h = 0; h < this.hosts; h++) {
-      const len = (await this.req(fi, 1, [h]))[4];
+      const info = await this.req(fi, 1, [h]);
+      if (info[0] !== h) throw new Error("host info reply for wrong channel");
+      const len = info[4];
       const bytes = [];
       while (bytes.length < len) {
         const r = await this.req(fi, 3, [h, bytes.length]);
+        // A late reply to an earlier request would otherwise be read as this one.
+        if (r[0] !== h || r[1] !== bytes.length) throw new Error("host name reply out of order");
         const take = Math.min(14, len - bytes.length);
         for (let i = 0; i < take; i++) bytes.push(r[2 + i]);
       }
@@ -261,37 +287,56 @@ function tick() {
 }
 
 
-// Name-based target: which channel (in the STAYING device's numbering) holds
-// the computer the other device just went to. Mirrors FollowPolicy.ResolveTarget
-// in logi-sync.ps1.
+// Which channel (in the STAYING device's numbering) to send the staying device
+// to. Only channels running logi-sync are targets once any are known: a device
+// sent anywhere else (an iPad) is stranded, because nothing there sends the
+// other one back. Mirrors FollowPolicy.ResolveTarget in logi-sync.ps1.
 const sameName = (a, b) => !!a && !!b && a.trim().toLowerCase() === b.trim().toLowerCase();
 function resolveTarget(stay, gone, learned) {
-  const names = stay.hostNames || [], here = names[stay.current];
-  const other12 = { channel: stay.current + 1 === 1 ? 2 : 1, dest: null };
-  if (!here) return { ...other12, why: "device doesn't report computer names: other of 1/2" };
-  // 1. Mouse buttons cycle to the next channel, so we know exactly where it went.
-  if (gone && !gone.isKeyboard && gone.hosts > 0 && gone.current >= 0) {
-    const next = (gone.hostNames || [])[(gone.current + 1) % gone.hosts];
-    const i = names.findIndex((n, j) => j !== stay.current && sameName(n, next) && !sameName(next, here));
-    if (i >= 0) return { channel: i + 1, dest: names[i], why: `mouse button moves to the next channel: ${names[i]}` };
+  const sn = stay.hostNames || [], sp = stay.participants || [], here = stay.current;
+  const gn = (gone && gone.hostNames) || [], gp = (gone && gone.participants) || [];
+  const label = (i) => sn[i] || `channel ${i + 1}`;
+  const othersMarked = (arr, except) => arr.some((v, i) => v && i !== except);
+  const namesBoth = !!sn[here] && gn.length > 0;
+  const toStay = (gc) => {
+    if (namesBoth) return sn.findIndex((n, i) => i !== here && sameName(n, gn[gc]));
+    return gc !== here ? gc : -1;
+  };
+  // 1. Mouse-led: walk its button's cycle to the first channel running logi-sync.
+  if (gone && !gone.isKeyboard && gone.hosts > 1 && gone.current >= 0) {
+    const marksKnown = othersMarked(gp, gone.current);
+    for (let step = 1; step < gone.hosts; step++) {
+      const gc = (gone.current + step) % gone.hosts;
+      if (marksKnown && !gp[gc]) continue;
+      const sc = toStay(gc);
+      if (sc < 0) break;
+      return { channel: sc + 1, dest: sn[sc] || null, certain: true,
+        why: step === 1 ? `mouse moved to the next channel: ${label(sc)}`
+                        : `mouse button passes ${step - 1} channel(s) not running logi-sync; next one running it: ${label(sc)}` };
+    }
   }
-  // 2. Other computers this device knows, preferring ones the other device knows too.
-  let cands = names.map((n, i) => i).filter((i) => i !== stay.current && names[i] && !sameName(names[i], here));
-  const goneNames = (gone && gone.hostNames) || [];
-  const both = cands.filter((i) => goneNames.some((n) => sameName(n, names[i])));
-  if (both.length) cands = both;
-  if (!cands.length) return { ...other12, why: "no other computer paired: other of 1/2" };
-  if (cands.length === 1) return { channel: cands[0] + 1, dest: names[cands[0]], why: `the only other computer: ${names[cands[0]]}` };
-  const l = cands.find((i) => sameName(names[i], learned));
-  if (l !== undefined) return { channel: l + 1, dest: names[l], why: `where you went last time: ${names[l]}` };
-  return { channel: cands[0] + 1, dest: names[cands[0]], why: `lowest other channel (no history yet): ${names[cands[0]]}` };
+  // 2. Candidates: channels running logi-sync, else other paired computers.
+  let cands, basis;
+  if (othersMarked(sp, here)) { cands = sp.map((v, i) => (v && i !== here ? i : -1)).filter((i) => i >= 0); basis = "running logi-sync"; }
+  else {
+    cands = sn[here] ? sn.map((n, i) => i).filter((i) => i !== here && sn[i] && !sameName(sn[i], sn[here])) : [];
+    const both = cands.filter((i) => gn.some((n) => sameName(n, sn[i])));
+    if (both.length) cands = both;
+    basis = "paired (no logi-sync marks seen yet)";
+  }
+  if (!cands.length) return { channel: here + 1 === 1 ? 2 : 1, dest: null, certain: false, why: "nothing else known: other of 1/2" };
+  if (cands.length === 1) return { channel: cands[0] + 1, dest: sn[cands[0]] || null, certain: basis === "running logi-sync", why: `the only other computer ${basis}: ${label(cands[0])}` };
+  const l = cands.find((i) => sameName(sn[i], learned));
+  if (l !== undefined) return { channel: l + 1, dest: sn[l] || null, certain: false, why: `last computer you went to (${basis}): ${label(l)}` };
+  return { channel: cands[0] + 1, dest: sn[cands[0]] || null, certain: false, why: `lowest other channel ${basis}: ${label(cands[0])}` };
 }
+
 let lastGone = null;   // the device that most recently left (keeps its channel table)
 function targetFor(dev) {
   const fixed = Number($("target").value);
   if (fixed) return { channel: fixed, why: "fixed target" };
-  const r = resolveTarget(dev, lastGone, store.get("lastComputer", null));
-  if (r.dest) store.set("lastComputer", r.dest);
+  const r = resolveTarget(dev, lastGone, store.get("lastComputer2", null));
+  if (r.certain && r.dest) store.set("lastComputer2", r.dest);   // never learn from a guess
   return r;
 }
 

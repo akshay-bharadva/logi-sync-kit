@@ -11,7 +11,7 @@ const engineSrc = fs.readFileSync(path.join(__dirname, "..", "desktop-extension"
 
 /** A HID++ 2.0 device answering on `idx`: ChangeHost at feature 10, name at 5. */
 class FakeDev {
-  constructor(name, host = 0, hostNames = null) { this.name = name; this.host = host; this.hostNames = hostNames; this.switchedTo = null; this.online = true; this.busy = 0; }
+  constructor(name, host = 0, hostNames = null) { this.name = name; this.host = host; this.hostNames = hostNames; this.cookies = [0, 0, 0]; this.switchedTo = null; this.online = true; this.busy = 0; }
   answer(fi, fn, data) {
     if (fi === 0 && fn === 0) {
       const id = (data[3] << 8) | data[4];
@@ -24,6 +24,8 @@ class FakeDev {
     }
     if (fi === 10 && fn === 0) return [3, this.host];
     if (fi === 10 && fn === 1) { this.switchedTo = data[3] + 1; return null; }
+    if (fi === 10 && fn === 2) return this.cookies.slice();
+    if (fi === 10 && fn === 3) { this.cookies[data[3]] = data[4]; return [data[3]]; }
     if (fi === 5 && fn === 0) return [this.name.length];
     if (fi === 5 && fn === 1) return [...this.name.slice(data[3], data[3] + 16)].map((c) => c.charCodeAt(0));
     return null;
@@ -191,11 +193,46 @@ async function test(name, fn) {
     const kb = new FakeDev("Signature Slim K950", 0, HOSTS), ms = new FakeDev("Signature Plus M750 L", 0, HOSTS);
     const rx = new FakeHid(0xc548, "USB Receiver", 0xff00, new Map([[1, kb], [2, ms]]));
     const e = startEngine([rx]);
-    e.storage["logi-sync:lastComputer"] = JSON.stringify(HOSTS[2]);
+    e.storage["logi-sync:lastComputer2"] = JSON.stringify(HOSTS[2]);
     await wait(1500);
     rx.link(1, false);
     await wait(1300);
     assert.strictEqual(ms.switchedTo, 3, e.log());
+  });
+
+  await test("REGRESSION: mouse pressed on desktop goes 2->3(iPad)->1: keyboard follows to laptop, not iPad", async () => {
+    const kb = new FakeDev("Signature Slim K950", 1, HOSTS), ms = new FakeDev("Signature Plus M750 L", 1, HOSTS);
+    kb.cookies = [0x4c, 0, 0]; ms.cookies = [0x4c, 0, 0];   // laptop ran logi-sync; desktop marks itself on connect
+    const rx = new FakeHid(0xc548, "USB Receiver", 0xff00, new Map([[1, kb], [2, ms]]));
+    const e = startEngine([rx]);
+    e.storage["logi-sync:lastComputer2"] = JSON.stringify(HOSTS[2]);   // even a stale "iPad" memory
+    await wait(1500);
+    assert.deepStrictEqual(kb.cookies, [0x4c, 0x4c, 0], "desktop should mark its own channel");
+    rx.link(2, false);
+    await wait(1300);
+    assert.strictEqual(kb.switchedTo, 1, e.log());
+    assert.match(e.log(), /passes 1 channel/, e.log());
+  });
+
+  await test("REGRESSION: keyboard leads with laptop+desktop marked: mouse never goes to iPad", async () => {
+    const kb = new FakeDev("Signature Slim K950", 1, HOSTS), ms = new FakeDev("Signature Plus M750 L", 1, HOSTS);
+    kb.cookies = [0x4c, 0x4c, 0]; ms.cookies = [0x4c, 0x4c, 0];
+    const rx = new FakeHid(0xc548, "USB Receiver", 0xff00, new Map([[1, kb], [2, ms]]));
+    const e = startEngine([rx]);
+    e.storage["logi-sync:lastComputer2"] = JSON.stringify(HOSTS[2]);
+    await wait(1500);
+    rx.link(1, false);
+    await wait(1300);
+    assert.strictEqual(ms.switchedTo, 1, e.log());
+  });
+
+  await test("host names: a busy device's failed read falls back to the cache", async () => {
+    const kb = new FakeDev("Signature Slim K950", 1, HOSTS), ms = new FakeDev("Signature Plus M750 L", 1, HOSTS);
+    const rx = new FakeHid(0xc548, "USB Receiver", 0xff00, new Map([[1, kb], [2, ms]]));
+    const e = startEngine([rx]);
+    await wait(1500);
+    const cached = JSON.parse(e.storage["logi-sync:names:rxc548:2"]);
+    assert.deepStrictEqual(cached, HOSTS);
   });
 
   await test("bluetooth-direct device flags the warning", async () => {

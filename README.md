@@ -99,19 +99,21 @@ Any device can lead in either direction.
   **if one device leaves and stays gone for 1 second while the other is still
   here, the other is sent to the same place** with Logitech's HID++ *ChangeHost*
   command.
-- **"The same place" is worked out by computer name, not channel number.** Each
-  device remembers the name of the computer on each of its channels, and
-  logi-sync reads those names:
-  - **The mouse leads:** its button cycles to the next channel, so we know exactly
-    which computer it went to. The keyboard goes to the channel with that name.
-  - **The keyboard leads:** the mouse goes to the other computer both devices are
-    paired with. If there are several (an iPad on channel 3, say), it picks the one
-    used last time. With no history yet, it picks the lowest other channel.
-  - Any channel layout works, including the keyboard and mouse numbering the same
-    computer differently.
-  - To pin a fixed channel instead, use the extension's **Follow to** setting or the
-    script's `-Target 3`.
-  - `logi-sync.ps1 status` shows each device's channels and computer names.
+- **It only ever follows to computers that run logi-sync.** Each copy writes a
+  small marker for its own channel onto the keyboard and mouse (an Easy-Switch
+  "cookie", stored on the device). So once logi-sync has seen the devices on
+  each computer, every copy knows which channels to follow to. A phone or
+  tablet on another channel is never a target: a device sent there would be
+  stranded, because nothing there sends the other one back.
+  - **The mouse leads:** its button cycles channels, so we walk the cycle to the
+    next channel running logi-sync. Pressing the button on the desktop goes
+    2 → 3 (iPad) → 1, and the keyboard goes straight to the laptop.
+  - **The keyboard leads:** the mouse goes to the other computer running
+    logi-sync. With more than one, it picks the one you last went to for sure.
+  - The same computer can be on different channel numbers on the keyboard and the
+    mouse: they're matched by computer name.
+  - To pin a channel, use the extension's **Follow to** setting or the script's `-Target 3`.
+  - `logi-sync.ps1 status` lists each channel's computer and whether it runs logi-sync.
 - Nothing happens if **both** devices drop at once (sleep, Bluetooth off), or if
   the device comes back within the second.
 - Both halves re-check the real device state every few seconds, so a missed event
@@ -121,8 +123,11 @@ Any device can lead in either direction.
 
 - **Turning a device off** looks the same as switching it away, so the other one
   follows. On the laptop, run `stop` first if you do this on purpose.
-- With **three or more** computers, a **keyboard**-led switch is a best guess:
-  the most recently used other computer. Mouse-led switches are exact.
+- **The first switch after setup**, before logi-sync has run on both computers,
+  falls back to the lowest other paired channel. After each computer has seen the
+  devices once, only marked computers are used.
+- With **three or more computers running logi-sync**, a keyboard-led switch picks
+  the one you last went to. Mouse-led switches are exact.
 - The **extension needs a USB receiver** on that computer. With direct Bluetooth,
   the browser forgets the device each time it switches away, because those devices
   report no serial number. The extension shows a warning if that's the case. Use
