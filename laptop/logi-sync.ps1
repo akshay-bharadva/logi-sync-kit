@@ -670,8 +670,11 @@ function Start-Background {
 }
 
 function Invoke-Self([string[]]$CmdArgs, [string]$Script = $PSCommandPath) {
-    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Script @CmdArgs
-    return $LASTEXITCODE
+    # Send the child's output to the screen, not down the pipeline: otherwise the
+    # function "returns" every printed line plus the exit code, and `-ne 0` on that
+    # array is always truthy (install wrongly reported "Self-test failed").
+    & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $Script @CmdArgs | Out-Host
+    return [int]$LASTEXITCODE
 }
 
 # Commands that don't need the HID helper.
